@@ -1,88 +1,80 @@
 interface Env {
   CORS_ALLOW_ORIGIN: string;
   HELIUS_API_KEY: string;
+  // если хотите, вынесите URL локальной ноды в переменную окружения:
+  // LOCAL_NODE_URL: string;
 }
 
 export default {
   async fetch(request: Request, env: Env) {
-    // Разбор CORS
-    const supportedDomains = env.CORS_ALLOW_ORIGIN
-      ? env.CORS_ALLOW_ORIGIN.split(',')
+    // 1) CORS-подготовка
+    const supported = env.CORS_ALLOW_ORIGIN
+      ? env.CORS_ALLOW_ORIGIN.split(",")
       : undefined;
     const corsHeaders: Record<string, string> = {
       "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     };
-    if (supportedDomains) {
+    if (supported) {
       const origin = request.headers.get("Origin");
-      if (origin && supportedDomains.includes(origin)) {
+      if (origin && supported.includes(origin)) {
         corsHeaders["Access-Control-Allow-Origin"] = origin;
       }
     } else {
       corsHeaders["Access-Control-Allow-Origin"] = "*";
     }
-
-    // Обрабатываем preflight
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 200,
-        headers: corsHeaders,
-      });
+      return new Response(null, { status: 200, headers: corsHeaders });
     }
 
-    // Если это WebSocket, просто проксируем на Helius
-    const upgradeHeader = request.headers.get("Upgrade");
-    if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
-      return await fetch(
+    // 2) WebSocket-прокси (без дублирования)
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade && upgrade.toLowerCase() === "websocket") {
+      return fetch(
         `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`,
         request
       );
     }
 
-    // Подготовка URL и тела запроса
+    // 3) Подготовка URL и тела
     const { pathname, search } = new URL(request.url);
     const body = await request.text();
     const heliusBase =
-      pathname === "/"
-        ? "https://mainnet.helius-rpc.com/"
-        : "https://api.helius.xyz";
+      pathname === "/" ? "https://mainnet.helius-rpc.com/" : "https://api.helius.xyz";
     const heliusUrl = `${heliusBase}${pathname}?api-key=${env.HELIUS_API_KEY}${
       search ? `&${search.slice(1)}` : ""
     }`;
-    const localUrl = `https://rpc.onenodes.org${pathname}${search}`;
 
-    // Заголовки
-    const commonHeaders: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
+    // ваш адрес ноды:
+    const localUrl = `https://rpc.onenodes.org${pathname}${search}`;
+    // или из env:
+    // const localUrl = `${env.LOCAL_NODE_URL}${pathname}${search}`;
+
+    const commonHeaders = { "Content-Type": "application/json" };
     const heliusHeaders = {
       ...commonHeaders,
       "X-Helius-Cloudflare-Proxy": "true",
     };
 
-    // Создаём два объекта запроса
-    const heliusRequest = new Request(heliusUrl, {
+    const heliusReq = new Request(heliusUrl, {
       method: request.method,
       headers: heliusHeaders,
       body: body || null,
     });
-    const localRequest = new Request(localUrl, {
+    const localReq = new Request(localUrl, {
       method: request.method,
       headers: commonHeaders,
       body: body || null,
     });
 
-    // Отправляем оба запроса параллельно
-    const [heliusRes] = await Promise.all([
-      fetch(heliusRequest),
-      // не ждем локальный ответ, чтобы не задерживать пользователя
-      fetch(localRequest).catch((err) => {
-        // сюда можно добавить логирование ошибок
-        console.error("Local node error:", err);
-      }),
-    ]);
+    // 4) Fire-and-forget для локальной ноды
+    //    сразу отсылаем fetch, но не ждём:
+    fetch(localReq).catch((err) => {
+      console.error("Local node error:", err);
+    });
 
-    // Формируем ответ клиенту на основе Helius
+    // 5) Ждём только Helius и отправляем ответ клиенту
+    const heliusRes = await fetch(heliusReq);
     return new Response(heliusRes.body, {
       status: heliusRes.status,
       headers: corsHeaders,
