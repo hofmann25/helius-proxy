@@ -1,22 +1,20 @@
 interface Env {
-  CORS_ALLOW_ORIGIN: string;      // допустимые Origin через запятую, или пусто = "*"
-  LOCAL_NODE_URL: string;         // адрес вашей ноды, например "http://45.139.132.172:51250"
+  CORS_ALLOW_ORIGIN: string;
+  HELIUS_API_KEY: string;
 }
 
 export default {
   async fetch(request: Request, env: Env) {
-    // Настройка CORS
+    // Разбор CORS
     const supportedDomains = env.CORS_ALLOW_ORIGIN
-      ? env.CORS_ALLOW_ORIGIN.split(',').map(s => s.trim())
+      ? env.CORS_ALLOW_ORIGIN.split(',')
       : undefined;
-
     const corsHeaders: Record<string, string> = {
       "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     };
-
     if (supportedDomains) {
-      const origin = request.headers.get('Origin');
+      const origin = request.headers.get("Origin");
       if (origin && supportedDomains.includes(origin)) {
         corsHeaders["Access-Control-Allow-Origin"] = origin;
       }
@@ -24,47 +22,70 @@ export default {
       corsHeaders["Access-Control-Allow-Origin"] = "*";
     }
 
-    // Обрабатываем preflight-запросы
+    // Обрабатываем preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
-        status: 204,
+        status: 200,
         headers: corsHeaders,
       });
     }
 
-    const { pathname, search } = new URL(request.url);
-    const targetUrl = new URL(env.LOCAL_NODE_URL);
-    targetUrl.pathname = pathname;
-    targetUrl.search = search;
-
-    // Если это WebSocket upgrade — проксируем напрямую
-    const upgrade = request.headers.get("Upgrade");
-    if (upgrade && upgrade.toLowerCase() === "websocket") {
-      return fetch(targetUrl.toString(), request);
+    // Если это WebSocket, просто проксируем на Helius
+    const upgradeHeader = request.headers.get("Upgrade");
+    if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
+      return await fetch(
+        `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`,
+        request
+      );
     }
 
-    // Составляем проксируемый запрос к локальной ноде
+    // Подготовка URL и тела запроса
+    const { pathname, search } = new URL(request.url);
     const body = await request.text();
-    const proxyReq = new Request(targetUrl.toString(), {
+    const heliusBase =
+      pathname === "/"
+        ? "https://mainnet.helius-rpc.com/"
+        : "https://api.helius.xyz";
+    const heliusUrl = `${heliusBase}${pathname}?api-key=${env.HELIUS_API_KEY}${
+      search ? `&${search.slice(1)}` : ""
+    }`;
+    const localUrl = `https://rpc.onenodes.org${pathname}${search}`;
+
+    // Заголовки
+    const commonHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    const heliusHeaders = {
+      ...commonHeaders,
+      "X-Helius-Cloudflare-Proxy": "true",
+    };
+
+    // Создаём два объекта запроса
+    const heliusRequest = new Request(heliusUrl, {
       method: request.method,
-      headers: {
-        "Content-Type": request.headers.get("Content-Type") || "application/json",
-        // можно пробросить и другие заголовки, если нужно:
-        // ...Object.fromEntries(request.headers)
-      },
-      body: body.length > 0 ? body : null,
+      headers: heliusHeaders,
+      body: body || null,
+    });
+    const localRequest = new Request(localUrl, {
+      method: request.method,
+      headers: commonHeaders,
+      body: body || null,
     });
 
-    // Выполняем запрос
-    const res = await fetch(proxyReq);
+    // Отправляем оба запроса параллельно
+    const [heliusRes] = await Promise.all([
+      fetch(heliusRequest),
+      // не ждем локальный ответ, чтобы не задерживать пользователя
+      fetch(localRequest).catch((err) => {
+        // сюда можно добавить логирование ошибок
+        console.error("Local node error:", err);
+      }),
+    ]);
 
-    // Возвращаем ответ с нужными CORS-заголовками
-    const responseHeaders = new Headers(res.headers);
-    Object.entries(corsHeaders).forEach(([k, v]) => responseHeaders.set(k, v));
-
-    return new Response(res.body, {
-      status: res.status,
-      headers: responseHeaders,
+    // Формируем ответ клиенту на основе Helius
+    return new Response(heliusRes.body, {
+      status: heliusRes.status,
+      headers: corsHeaders,
     });
-  }
+  },
 };
