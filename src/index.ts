@@ -1,62 +1,70 @@
 interface Env {
-	CORS_ALLOW_ORIGIN: string;
-	HELIUS_API_KEY: string;
+  CORS_ALLOW_ORIGIN: string;      // допустимые Origin через запятую, или пусто = "*"
+  LOCAL_NODE_URL: string;         // адрес вашей ноды, например "http://45.139.132.172:51250"
 }
 
 export default {
-	async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env) {
+    // Настройка CORS
+    const supportedDomains = env.CORS_ALLOW_ORIGIN
+      ? env.CORS_ALLOW_ORIGIN.split(',').map(s => s.trim())
+      : undefined;
 
-		// If the request is an OPTIONS request, return a 200 response with permissive CORS headers
-		// This is required for the Helius RPC Proxy to work from the browser and arbitrary origins
-		// If you wish to restrict the origins that can access your Helius RPC Proxy, you can do so by
-		// changing the `*` in the `Access-Control-Allow-Origin` header to a specific origin.
-		// For example, if you wanted to allow requests from `https://example.com`, you would change the
-		// header to `https://example.com`. Multiple domains are supported by verifying that the request
-		// originated from one of the domains in the `CORS_ALLOW_ORIGIN` environment variable.
-		const supportedDomains = env.CORS_ALLOW_ORIGIN ? env.CORS_ALLOW_ORIGIN.split(',') : undefined;
-		const corsHeaders: Record<string, string> = {
-			"Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
-			"Access-Control-Allow-Headers": "*",
-		}
-		if (supportedDomains) {
-			const origin = request.headers.get('Origin')
-			if (origin && supportedDomains.includes(origin)) {
-				corsHeaders['Access-Control-Allow-Origin'] = origin
-			}
-		} else {
-			corsHeaders['Access-Control-Allow-Origin'] = '*'
-		}
+    const corsHeaders: Record<string, string> = {
+      "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
+      "Access-Control-Allow-Headers": "*",
+    };
 
-		if (request.method === "OPTIONS") {
-			return new Response(null, {
-				status: 200,
-				headers: corsHeaders,
-			});
-		}
+    if (supportedDomains) {
+      const origin = request.headers.get('Origin');
+      if (origin && supportedDomains.includes(origin)) {
+        corsHeaders["Access-Control-Allow-Origin"] = origin;
+      }
+    } else {
+      corsHeaders["Access-Control-Allow-Origin"] = "*";
+    }
 
-		const upgradeHeader = request.headers.get('Upgrade')
+    // Обрабатываем preflight-запросы
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders,
+      });
+    }
 
-		if (upgradeHeader || upgradeHeader === 'websocket') {
-			return await fetch(`https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`, request)
-		}
+    const { pathname, search } = new URL(request.url);
+    const targetUrl = new URL(env.LOCAL_NODE_URL);
+    targetUrl.pathname = pathname;
+    targetUrl.search = search;
 
+    // Если это WebSocket upgrade — проксируем напрямую
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade && upgrade.toLowerCase() === "websocket") {
+      return fetch(targetUrl.toString(), request);
+    }
 
-		const { pathname, search } = new URL(request.url)
-		const payload = await request.text();
-		const proxyRequest = new Request(`https://${pathname === '/' ? 'mainnet.helius-rpc.com' : 'api.helius.xyz'}${pathname}?api-key=${env.HELIUS_API_KEY}${search ? `&${search.slice(1)}` : ''}`, {
-			method: request.method,
-			body: payload || null,
-			headers: {
-				'Content-Type': 'application/json',
-				'X-Helius-Cloudflare-Proxy': 'true',
-			}
-		});
+    // Составляем проксируемый запрос к локальной ноде
+    const body = await request.text();
+    const proxyReq = new Request(targetUrl.toString(), {
+      method: request.method,
+      headers: {
+        "Content-Type": request.headers.get("Content-Type") || "application/json",
+        // можно пробросить и другие заголовки, если нужно:
+        // ...Object.fromEntries(request.headers)
+      },
+      body: body.length > 0 ? body : null,
+    });
 
-		return await fetch(proxyRequest).then(res => {
-			return new Response(res.body, {
-				status: res.status,
-				headers: corsHeaders
-			});
-		});
-	},
+    // Выполняем запрос
+    const res = await fetch(proxyReq);
+
+    // Возвращаем ответ с нужными CORS-заголовками
+    const responseHeaders = new Headers(res.headers);
+    Object.entries(corsHeaders).forEach(([k, v]) => responseHeaders.set(k, v));
+
+    return new Response(res.body, {
+      status: res.status,
+      headers: responseHeaders,
+    });
+  }
 };
