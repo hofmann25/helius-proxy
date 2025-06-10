@@ -1,4 +1,4 @@
-name = "helius-proxy"
+name = 'node-proxy'
 main = "./src/index.ts"
 compatibility_date = "2022-05-03"
 # wrangler.toml (wrangler v3.88.0^)
