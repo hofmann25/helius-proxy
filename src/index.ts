@@ -1,46 +1,61 @@
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request))
-})
-
-/**
- * Проксирует запрос на указанный Solana-RPC
- * @param {Request} request
- * @returns {Promise<Response>}
- */
-async function handleRequest(request) {
-  // Исходный URL запроса к вашему воркеру:
-  const incomingUrl = new URL(request.url)
-
-  // Собираем целевой URL, подставляя хост, порт и сохраняя путь + query
-  const targetUrl = new URL(incomingUrl.pathname + incomingUrl.search, 'http://45.139.132.172:80')
-
-  // Клонируем заголовки, чтобы можно было модифицировать
-  const newHeaders = new Headers(request.headers)
-  // Переназначаем Host на адрес вашей ноды
-  newHeaders.set('Host', '45.139.132.172')
-  // (по желанию) Удаляем лишние заголовки от Cloudflare
-  newHeaders.delete('cf-visitor')
-  newHeaders.delete('cf-ray')
-  newHeaders.delete('cf-request-id')
-
-  // Формируем новый запрос к целевому серверу
-  const proxiedRequest = new Request(targetUrl.toString(), {
-    method:  request.method,
-    headers: newHeaders,
-    body:    request.body,
-    redirect:'manual'
-  })
-
-  // Выполняем запрос и возвращаем ответ «как есть»
-  const response = await fetch(proxiedRequest)
-
-  // (по желанию) Можно пробросить CORS-заголовки, если планируете вызывать RPC из браузера:
-  // const corsHeaders = { 'Access-Control-Allow-Origin': '*' }
-  // return new Response(response.body, {
-  //   status: response.status,
-  //   statusText: response.statusText,
-  //   headers: {...Object.fromEntries(response.headers), ...corsHeaders}
-  // })
-
-  return response
+interface Env {
+	CORS_ALLOW_ORIGIN: string;
 }
+
+export default {
+	async fetch(request: Request, env: Env) {
+
+		// If the request is an OPTIONS request, return a 200 response with permissive CORS headers
+		// This is required for the Helius RPC Proxy to work from the browser and arbitrary origins
+		// If you wish to restrict the origins that can access your Helius RPC Proxy, you can do so by
+		// changing the `*` in the `Access-Control-Allow-Origin` header to a specific origin.
+		// For example, if you wanted to allow requests from `https://example.com`, you would change the
+		// header to `https://example.com`. Multiple domains are supported by verifying that the request
+		// originated from one of the domains in the `CORS_ALLOW_ORIGIN` environment variable.
+		const supportedDomains = env.CORS_ALLOW_ORIGIN ? env.CORS_ALLOW_ORIGIN.split(',') : undefined;
+		const corsHeaders: Record<string, string> = {
+			"Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
+			"Access-Control-Allow-Headers": "*",
+		}
+		if (supportedDomains) {
+			const origin = request.headers.get('Origin')
+			if (origin && supportedDomains.includes(origin)) {
+				corsHeaders['Access-Control-Allow-Origin'] = origin
+			}
+		} else {
+			corsHeaders['Access-Control-Allow-Origin'] = '*'
+		}
+
+		if (request.method === "OPTIONS") {
+			return new Response(null, {
+				status: 200,
+				headers: corsHeaders,
+			});
+		}
+
+		const upgradeHeader = request.headers.get('Upgrade')
+
+		if (upgradeHeader || upgradeHeader === 'websocket') {
+			return await fetch(`http://45.139.132.172:51250`, request)
+		}
+
+
+		const { pathname, search } = new URL(request.url)
+		const payload = await request.text();
+		const proxyRequest = new Request(`http://45.139.132.172:51250${search ? `&${search.slice(1)}` : ''}`, {
+			method: request.method,
+			body: payload || null,
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Helius-Cloudflare-Proxy': 'true',
+			}
+		});
+
+		return await fetch(proxyRequest).then(res => {
+			return new Response(res.body, {
+				status: res.status,
+				headers: corsHeaders
+			});
+		});
+	},
+};
