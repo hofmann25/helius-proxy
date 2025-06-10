@@ -1,73 +1,74 @@
 export interface Env {
-  /// Список разрешённых Origin через запятую, или пустая строка для “*”
+  /// Список разрешённых Origin, разделённых запятыми. Пустая = “*”
   CORS_ALLOW_ORIGIN: string;
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // --- 1) CORS-подготовка ----------------------------------------------
-    const supported = env.CORS_ALLOW_ORIGIN
-      ? env.CORS_ALLOW_ORIGIN.split(',')
+    // --- 1) CORS -------------------------------------------------------
+    const allowed = env.CORS_ALLOW_ORIGIN
+      ? env.CORS_ALLOW_ORIGIN.split(',').map(s => s.trim())
       : null;
 
+    const origin = request.headers.get('Origin') || '';
     const corsHeaders: Record<string,string> = {
       'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, OPTIONS',
       'Access-Control-Allow-Headers': '*',
     };
-
-    if (supported) {
-      const origin = request.headers.get('Origin');
-      if (origin && supported.includes(origin)) {
-        corsHeaders['Access-Control-Allow-Origin'] = origin;
-      }
-    } else {
-      corsHeaders['Access-Control-Allow-Origin'] = '*';
+    if (!allowed || allowed.includes(origin)) {
+      corsHeaders['Access-Control-Allow-Origin'] = origin || '*';
     }
 
-    // OPTIONS — сразу возвращаем 200 с CORS
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 200, headers: corsHeaders });
     }
 
-    // --- 2) Проксирование -----------------------------------------------
-    const { pathname, search } = new URL(request.url);
+    // --- 2) Собираем URL и тело ----------------------------------------
+    const incoming = new URL(request.url);
+    const targetUrl = new URL(request.url);
+    targetUrl.protocol = 'http:';
+    targetUrl.hostname = '45.139.132.172';
+    targetUrl.port     = '80';
+    // Оставляем путь и query без изменений:
+    targetUrl.pathname = incoming.pathname;
+    targetUrl.search   = incoming.search;
 
-    // Собираем URL вашей ноды
-    const target = `http://45.139.132.172:80${pathname}${search}`;
+    // Клонируем заголовки, но не меняем Host
+    const headers = new Headers(request.headers);
+    // если у вас есть особые служебные заголовки от CF, можно их почистить здесь:
+    headers.delete('cf-visitor');
+    headers.delete('cf-ray');
+    headers.delete('cf-request-id');
 
-    // Читаем тело только если оно есть
-    let body: string | null = null;
+    // Читаем тело для небезопасных методов
+    let body: ArrayBuffer | null = null;
     if (!['GET','HEAD'].includes(request.method)) {
-      body = await request.text();
+      body = await request.clone().arrayBuffer();
     }
 
-    // Сохраняем Content-Type из оригинала или ставим JSON по умолчанию
-    const contentType = request.headers.get('Content-Type') || 'application/json';
-
-    const proxyReq = new Request(target, {
-      method: request.method,
-      headers: {
-        'Content-Type': contentType,
-        // здесь можно добавить любые другие нужные вам заголовки
-      },
+    // --- 3) Создаём новый Request с поддержкой WebSocket -------------
+    const proxyReq = new Request(targetUrl.toString(), {
+      method:  request.method,
+      headers,
       body,
       redirect: 'manual',
+      // для WebSocket upgrade
+      duplex: 'half',
     });
 
-    // Делаем запрос к вашей ноде
+    // --- 4) Посылаем и возвращаем ответ -------------------------------
     const upstream = await fetch(proxyReq);
 
-    // --- 3) Возвращаем ответ с CORS -------------------------------------
+    // Собираем финальные заголовки
     const respHeaders = new Headers(upstream.headers);
-    // Пробрасываем CORS в ответ
     for (const [k,v] of Object.entries(corsHeaders)) {
       respHeaders.set(k, v);
     }
 
     return new Response(upstream.body, {
-      status: upstream.status,
+      status:     upstream.status,
       statusText: upstream.statusText,
-      headers: respHeaders,
+      headers:    respHeaders
     });
   }
 }
