@@ -1,62 +1,71 @@
-interface Env {
-	CORS_ALLOW_ORIGIN: string;
-	HELIUS_API_KEY: string;
+export interface Env {
+  CORS_ALLOW_ORIGIN: string;    // через запятую список разрешённых Origin, или пусто для *
+  RPC_NODE_URL: string;         // например "http://45.139.132.172:80"
 }
 
 export default {
-	async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // --- CORS ---
+    const supported = env.CORS_ALLOW_ORIGIN
+      ? env.CORS_ALLOW_ORIGIN.split(',').map(s => s.trim())
+      : null;
+    const corsHeaders: Record<string,string> = {
+      "Access-Control-Allow-Methods": "GET,HEAD,POST,PUT,OPTIONS",
+      "Access-Control-Allow-Headers": "*"
+    };
+    if (supported) {
+      const origin = request.headers.get("Origin");
+      if (origin && supported.includes(origin)) {
+        corsHeaders["Access-Control-Allow-Origin"] = origin;
+      }
+    } else {
+      corsHeaders["Access-Control-Allow-Origin"] = "*";
+    }
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
 
-		// If the request is an OPTIONS request, return a 200 response with permissive CORS headers
-		// This is required for the Helius RPC Proxy to work from the browser and arbitrary origins
-		// If you wish to restrict the origins that can access your Helius RPC Proxy, you can do so by
-		// changing the `*` in the `Access-Control-Allow-Origin` header to a specific origin.
-		// For example, if you wanted to allow requests from `https://example.com`, you would change the
-		// header to `https://example.com`. Multiple domains are supported by verifying that the request
-		// originated from one of the domains in the `CORS_ALLOW_ORIGIN` environment variable.
-		const supportedDomains = env.CORS_ALLOW_ORIGIN ? env.CORS_ALLOW_ORIGIN.split(',') : undefined;
-		const corsHeaders: Record<string, string> = {
-			"Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
-			"Access-Control-Allow-Headers": "*",
-		}
-		if (supportedDomains) {
-			const origin = request.headers.get('Origin')
-			if (origin && supportedDomains.includes(origin)) {
-				corsHeaders['Access-Control-Allow-Origin'] = origin
-			}
-		} else {
-			corsHeaders['Access-Control-Allow-Origin'] = '*'
-		}
+    // --- WebSocket (опционально, если нода поддерживает) ---
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade && upgrade.toLowerCase() === "websocket") {
+      // Проксируем WS-запрос на ws://45.139.132.172:80 (или wss:// если TLS)
+      const wsUrl = env.RPC_NODE_URL.replace(/^http/, "ws");
+      return fetch(new Request(wsUrl, request), { duplex: "half" });
+    }
 
-		if (request.method === "OPTIONS") {
-			return new Response(null, {
-				status: 200,
-				headers: corsHeaders,
-			});
-		}
+    // --- HTTP JSON-RPC ---
+    const url = new URL(request.url);
+    const path = url.pathname;   // обычно "/"
+    const query = url.search;    // если есть дополнительные параметры
 
-		const upgradeHeader = request.headers.get('Upgrade')
+    const target = `${env.RPC_NODE_URL}${path}${query}`;
+    const body = ["GET","HEAD"].includes(request.method)
+      ? null
+      : await request.text();
 
-		if (upgradeHeader || upgradeHeader === 'websocket') {
-			return await fetch(`https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`, request)
-		}
+    const proxyReq = new Request(target, {
+      method: request.method,
+      headers: {
+        // передаём все оригинальные заголовки, кроме Host
+        ...Object.fromEntries(
+          Array.from(request.headers.entries())
+            .filter(([k]) => k.toLowerCase() !== "host")
+        ),
+        "Content-Type": "application/json"
+      },
+      body,
+    });
 
+    const res = await fetch(proxyReq);
+    // копируем все заголовки ответа от ноды, и добавляем CORS
+    const responseHeaders = new Headers(res.headers);
+    for (const [k, v] of Object.entries(corsHeaders)) {
+      responseHeaders.set(k, v);
+    }
 
-		const { pathname, search } = new URL(request.url)
-		const payload = await request.text();
-		const proxyRequest = new Request(`https://${pathname === '/' ? 'mainnet.helius-rpc.com' : 'api.helius.xyz'}${pathname}?api-key=${env.HELIUS_API_KEY}${search ? `&${search.slice(1)}` : ''}`, {
-			method: request.method,
-			body: payload || null,
-			headers: {
-				'Content-Type': 'application/json',
-				'X-Helius-Cloudflare-Proxy': 'true',
-			}
-		});
-
-		return await fetch(proxyRequest).then(res => {
-			return new Response(res.body, {
-				status: res.status,
-				headers: corsHeaders
-			});
-		});
-	},
+    return new Response(res.body, {
+      status: res.status,
+      headers: responseHeaders
+    });
+  }
 };
